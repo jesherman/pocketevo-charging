@@ -137,6 +137,12 @@ applies `patches/*.patch` after armada's own series, builds the kernel, builds
 `deploy.sh <bundle.tar.gz> <user@host>` copies a bundle to a device and runs the
 installer.
 
+Builds are reproducible modulo one detail: three independent builds of the
+in-tree `qcom_battmgr.ko` produced a byte-identical sha256, while the
+out-of-tree `hl7139_evo.ko` embeds the absolute directory it was built in and so
+differs between build paths only. The whole-kernel tarball is not reproducible —
+it carries timestamps and is not meant to be compared byte for byte.
+
 ### Two things that will bite you
 
 **Split BTF must be stripped.** An in-tree module carries `.BTF` + `.BTF.base`.

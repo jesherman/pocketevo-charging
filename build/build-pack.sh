@@ -111,7 +111,8 @@ done
 
 log "verifying vermagic"
 for m in "$MODDIR"/*.ko; do
-	vm="$(tr '\0' '\n' < "$m" | grep -m1 '^vermagic=' || true)"
+	# grep -m1 exits early, which SIGPIPEs tr; keep that out of the log.
+	vm="$(tr '\0' '\n' < "$m" 2>/dev/null | grep -m1 '^vermagic=' || true)"
 	printf '    %-20s %s\n' "$(basename "$m")" "$vm" >&2
 done
 
