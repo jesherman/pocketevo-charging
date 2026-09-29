@@ -1,0 +1,7 @@
+# Re-apply the charging pack whenever the USB supply comes online.
+#
+# The boot-time apply instantiates the HL7139 pumps over i2c. If the device
+# boots on battery and the charger is only plugged in later, the pumps may not
+# have answered i2c yet, so this re-runs the apply (idempotent) and starts the
+# policy unit if it was skipped at boot.
+SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_NAME}=="qcom-battmgr-usb", ENV{POWER_SUPPLY_ONLINE}=="1", TAG+="systemd", ENV{SYSTEMD_WANTS}+="armada-charging-pack.service armada-pocketevo-charge-policy.service"

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=28W Charging
+GenericName=Pocket EVO charging control
+Comment=Show charging status, or re-apply the 28 W charging pack
+Exec=konsole --hold -e /var/armada/charging/bin/charging-control.sh menu
+Icon=battery-good-charging
+Terminal=false
+Categories=System;Settings;
+Keywords=charging;battery;armada;evo;

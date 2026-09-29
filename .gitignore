@@ -1,0 +1,25 @@
+# build outputs — never commit these
+.work/
+dist/
+out/
+bundle/
+modules-out/
+
+# kernel module build artifacts (source lives in driver/)
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.modules.order*
+.Module.symvers*
+modules.order
+Module.symvers
+
+# editor/OS noise
+*.swp
+.DS_Store
+
+# local build logs
+*.log
+.build-test.log

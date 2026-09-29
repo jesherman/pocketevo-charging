@@ -1,0 +1,19 @@
+[Unit]
+Description=Armada EVO direct-charge pack (kernel modules for 28 W charging)
+Documentation=file:/var/armada/charging/README.md
+# Runs on EVERY boot: after an OS update the image's /usr is new but /etc and
+# /var survive, so this re-establishes the patched modules each time.
+After=local-fs.target systemd-modules-load.service
+Before=armada-pocketevo-charge-policy.service
+ConditionPathExists=/var/armada/charging/bin/charging-pack-apply.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/var/armada/charging/bin/charging-pack-apply.sh
+# The script is written to always exit 0: a missing or mismatched pack must
+# degrade to stock charging, never block the boot.
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

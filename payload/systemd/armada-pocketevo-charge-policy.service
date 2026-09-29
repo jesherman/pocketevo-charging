@@ -1,0 +1,30 @@
+[Unit]
+Description=Experimental AYANEO Pocket EVO HL7139 direct-charge policy (28 W)
+After=systemd-modules-load.service armada-charging-pack.service
+Requires=armada-charging-pack.service
+# Only run once the pumps exist and the user has opted in.
+ConditionPathExists=/sys/class/power_supply/hl7139-5f
+ConditionPathExists=/sys/class/power_supply/hl7139-5e
+ConditionPathExists=/etc/armada/experimental/pocketevo-direct-charge
+
+[Service]
+Type=notify
+NotifyAccess=all
+WatchdogSec=600s
+# The power supplies are named by i2c address because these pumps have no
+# device-tree nodes in the stock image (see /var/armada/charging/README.md).
+Environment=ARMADA_CHARGE_MASTER=/sys/class/power_supply/hl7139-5f
+Environment=ARMADA_CHARGE_SLAVE=/sys/class/power_supply/hl7139-5e
+Environment=ARMADA_CHARGE_CLEANUP=/var/armada/charging/bin/armada-pocketevo-charge-cleanup
+# ADSP/battery-manager must be up before the policy probes sysfs.
+ExecStartPre=/bin/sleep 45
+ExecStart=/var/armada/charging/bin/armada-pocketevo-charge-policy
+ExecStopPost=/var/armada/charging/bin/armada-pocketevo-charge-cleanup
+Restart=on-failure
+RestartSec=30s
+TimeoutStopSec=10s
+RuntimeDirectory=armada-pocketevo-charge-policy
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target
