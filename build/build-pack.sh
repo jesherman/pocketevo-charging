@@ -42,7 +42,9 @@ if [ ! -d "$WORK/armada/.git" ]; then
 fi
 log "checking out $ARMADA_REF"
 git -C "$WORK/armada" fetch --depth 1 origin "$ARMADA_REF"
-git -C "$WORK/armada" checkout --detach FETCH_HEAD --quiet
+# -f is required on re-runs: the previous run appended our patches to the
+# tracked patches/series, and a plain checkout refuses to clobber it.
+git -C "$WORK/armada" checkout -f --detach FETCH_HEAD --quiet
 
 PKG="$WORK/armada/packages/kernel"
 [ -d "$PKG" ] || die "packages/kernel missing in armada@$ARMADA_REF"
