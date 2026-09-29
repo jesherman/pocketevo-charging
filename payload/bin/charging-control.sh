@@ -66,6 +66,8 @@ status_text() {
 		v=$(rd "/sys/class/power_supply/$pump/voltage_now")
 		i=$(rd "/sys/class/power_supply/$pump/current_now")
 		[ -n "${v:-}" ] && [ -n "${i:-}" ] || continue
+		# A disconnected rail reports a negative sentinel, not 0.
+		[ "$v" -ge 0 ] && [ "$i" -ge 0 ] || continue
 		total=$(( total + v * i / 1000000000000 ))
 	done
 	if [ "$total" -gt 0 ]; then
@@ -73,9 +75,13 @@ status_text() {
 	fi
 	v=$(rd "$USB/voltage_now"); i=$(rd "$USB/current_now")
 	if [ -n "${v:-}" ] && [ -n "${i:-}" ]; then
-		printf '  buck input:      %s.%03d V  %s.%03d A\n' \
-			"$((v/1000000))" "$(((v/1000)%1000))" \
-			"$((i/1000000))" "$(((i/1000)%1000))"
+		if [ "$v" -lt 0 ] || [ "$i" -lt 0 ]; then
+			printf '  buck input:      offline\n'
+		else
+			printf '  buck input:      %s.%03d V  %s.%03d A\n' \
+				"$((v/1000000))" "$(((v/1000)%1000))" \
+				"$((i/1000000))" "$(((i/1000)%1000))"
+		fi
 	fi
 	printf '  battery:         %s%%\n' "$(rd "$BAT/capacity")"
 }
