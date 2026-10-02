@@ -117,23 +117,10 @@ for m in "$MODDIR"/*.ko; do
 done
 
 # --- 5. bundle ----------------------------------------------------------------
-BUNDLE="$WORK/bundle"
-rm -rf "$BUNDLE"
-mkdir -p "$BUNDLE"/{bin,systemd,udev,desktop} "$BUNDLE/modules/$KREL"
-cp "$REPO/payload/install.sh" "$BUNDLE/"
-cp "$REPO/README.md" "$BUNDLE/"
-cp "$REPO"/payload/bin/* "$BUNDLE/bin/"
-cp "$REPO"/payload/systemd/*.service "$BUNDLE/systemd/"
-cp "$REPO"/payload/udev/*.rules "$BUNDLE/udev/"
-cp "$REPO"/payload/desktop/* "$BUNDLE/desktop/"
-cp "$MODDIR"/*.ko "$BUNDLE/modules/$KREL/"
-chmod 0755 "$BUNDLE/install.sh" "$BUNDLE"/bin/*
-
-TGZ="$OUT/charging-pack-$KREL.tar.gz"
-log "packing $TGZ"
-tar -C "$WORK" -czf "$TGZ" bundle
-( cd "$OUT" && sha256sum "$(basename "$TGZ")" > "$(basename "$TGZ").sha256" )
+# Staging lives in make-bundle.sh so that payload-only iteration
+# (`./build/make-bundle.sh`) uses the exact same implementation as a full build —
+# and so that changing a shell script or a unit does not cost a kernel rebuild.
+bash "$REPO/build/make-bundle.sh" "$KREL"
 
 echo
-cat "$OUT/$(basename "$TGZ").sha256"
-log "done — copy $TGZ to the device and run: sudo ./install.sh"
+log "done — copy the bundle to the device and run: sudo ./install.sh"

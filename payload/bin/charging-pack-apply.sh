@@ -57,6 +57,82 @@ for m in qcom_battmgr.ko hl7139_evo.ko; do
 done
 log "applying charging pack for kernel $KVER"
 
+# --- 1b. kernel-identity gate ------------------------------------------------------
+# The pack is keyed on the kernel RELEASE, but the release does not identify the
+# kernel. armada shipped 7.2.6 twice with different patch sets (174 series entries
+# against the 171 this pack's modules were built from) and uname -r reports the
+# same "7.2.6" both times. With CONFIG_MODVERSIONS off there is no CRC for the
+# kernel to check either, so a module built for the wrong build LOADS CLEANLY and
+# the pack reports "ok" while running against an unverified kernel. That happened
+# for real on 2026-10-01 (image 20260928.311ed3b -> 20261001.72f2a63) and went
+# unnoticed because nothing here looked.
+#
+# So we do not trust the release string. We fingerprint the interface this pack
+# actually compiles against -- every module the image ships for the power-supply
+# subsystem -- and require it to be what was present when this pack was validated
+# on this device. Deliberately NOT vmlinuz: measured across that same update,
+# armada added three unrelated kernel patches so vmlinuz changed, while every
+# power-supply module (including the qcom_battmgr.ko this pack replaces) came out
+# byte-identical. A gate keyed on vmlinuz would have refused a pack that was
+# provably still correct, and demanded a 40-minute kernel rebuild for nothing.
+#
+# A build-time hash would be useless here: our cross build and armada's CI build
+# are different compilations, so they never match byte for byte. Comparing the
+# device against its own earlier self is the only comparison that is meaningful.
+#
+# install.sh records the baseline; this script only ever compares. It deliberately
+# will NOT adopt a new kernel by itself, because then the first boot after an
+# update would silently bless modules that were never built for that kernel --
+# which is the exact failure this gate exists to prevent.
+#
+# The fingerprint logic lives in charging-kernel-fingerprint.sh so that the
+# installer, the applier and charging-control.sh share one implementation.
+FP="$PACK_ROOT/bin/charging-kernel-fingerprint.sh"
+KIDENT=""
+
+if [ "${ARMADA_CHARGING_SKIP_FINGERPRINT:-}" = "1" ]; then
+	KIDENT="gate bypassed (ARMADA_CHARGING_SKIP_FINGERPRINT=1)"
+	log "NOTICE: kernel-identity $KIDENT"
+elif [ ! -x "$FP" ]; then
+	degraded "kernel fingerprint helper missing ($FP); cannot verify this kernel (stock charging in use)"
+else
+	# MODBASE is honoured so tests/gate-test.sh can point the gate at a fake tree.
+	MODBASE="${MODBASE:-/usr/lib/modules/$KVER}" "$FP" check
+	case $? in
+	0)
+		KIDENT="match for $KVER -- the pack will load"
+		log "kernel fingerprint matches the validated baseline"
+		;;
+	2)
+		degraded "no kernel fingerprint on record for $KVER; re-run the pack's install.sh to validate this kernel (stock charging in use)"
+		;;
+	3)
+		degraded "cannot fingerprint this kernel (no power-supply modules under /usr/lib/modules/$KVER); refusing to load the pack (stock charging in use)"
+		;;
+	*)
+		was=$("$FP" show 2>/dev/null | sed -n 's/^image=//p' | head -1)
+		now=$(sed -n 's/^IMAGE_VERSION="\?\([^"]*\)"\?$/\1/p' /etc/os-release 2>/dev/null | head -1)
+		{
+			printf 'kernel-identity gate refused the pack\n'
+			printf '  last validated on : %s\n' "${was:-unknown}"
+			printf '  running image     : %s\n' "${now:-unknown}"
+			printf '  --- recorded ---\n'; "$FP" show
+			printf '  --- running ---\n'
+			MODBASE="${MODBASE:-/usr/lib/modules/$KVER}" "$FP" live
+		} >> "$PACK_ROOT/notes"
+		degraded "image kernel changed since this pack was validated (${was:-unknown} -> ${now:-unknown}); refusing to load modules built for another kernel -- rebuild the pack for this kernel and re-run install.sh"
+		;;
+	esac
+fi
+
+# --check runs the identity gate and stops: no module is loaded, no pump is
+# instantiated. Useful on the device to answer "will this survive a reboot?"
+# before rebooting, and it is what tests/gate-test.sh drives against a fake tree.
+if [ "${1:-}" = "--check" ]; then
+	printf 'kernel-identity: %s\n' "${KIDENT:-unknown}"
+	exit 0
+fi
+
 # --- 2. patched qcom_battmgr: PPS voltage + input-current setters -----------------
 # Identity check without srcversion: the patched driver declares VOLTAGE_NOW and
 # INPUT_CURRENT_LIMIT writable, so power_supply exposes them 0644. The stock

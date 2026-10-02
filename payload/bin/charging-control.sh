@@ -25,7 +25,7 @@ rd() { [ -r "$1" ] && cat "$1" 2>/dev/null; }
 is_loaded() { grep -q "^$1 " /proc/modules 2>/dev/null; }
 
 status_text() {
-	local kver mod_state battmgr pumps flag unit v i total pump
+	local kver mod_state battmgr pumps flag unit v i total pump kident
 	kver=$(uname -r)
 
 	if is_loaded qcom_battmgr; then
@@ -51,8 +51,27 @@ status_text() {
 	unit=$(systemctl is-active "$UNIT" 2>/dev/null) || true
 	[ -n "$unit" ] || unit=inactive
 
+	# The kernel-identity gate: the module pack is keyed on the release string, and
+	# armada has shipped more than one distinct 7.2.6, so "present" above does not
+	# mean the modules match the running kernel. Report the real verdict.
+	local fp fp_img rc
+	fp="$PACK_ROOT/bin/charging-kernel-fingerprint.sh"
+	if [ -x "$fp" ]; then
+		fp_img=$("$fp" show 2>/dev/null | sed -n 's/^image=//p' | head -1)
+		KVER="$kver" "$fp" check; rc=$?
+		case $rc in
+			0) kident="matches (validated on ${fp_img:-unknown})" ;;
+			2) kident="no baseline recorded" ;;
+			3) kident="cannot fingerprint this kernel" ;;
+			*) kident="CHANGED since ${fp_img:-unknown} -- pack will not load" ;;
+		esac
+	else
+		kident="helper missing"
+	fi
+
 	printf '  kernel:          %s\n' "$kver"
 	printf '  module pack:     %s\n' "$mod_state"
+	printf '  kernel identity: %s\n' "$kident"
 	printf '  qcom_battmgr:    %s\n' "$battmgr"
 	printf '  HL7139 pumps:    %s\n' "$pumps"
 	printf '  direct charge:   %s\n' "$flag"
