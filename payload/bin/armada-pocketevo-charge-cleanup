@@ -57,21 +57,35 @@ fi
 
 rm -f "$STATE_DIR/active"
 
-usb_online=$(cat "$USB/online" 2>/dev/null) || usb_online=unknown
-if test "$usb_online" = 0; then
-	log 'both pumps verified off; USB offline'
-	exit 0
-fi
-
 # Once both CHG_EN bits are confirmed clear, return the PPS request to the
 # normal 9.6 V region and release the Qualcomm charger from the 13 mA handoff.
 # A non-PPS source can reject voltage_now; restoring ICL is safe because the
 # direct path has already been proven off.
+#
+# This restore must run even when VBUS is absent. The PPS request and the 13 mA
+# handoff limit live in the charger firmware and outlive a cable pull, so
+# skipping the restore strands the *next* plug-in at a 5 V / 0 A operating
+# point. On 2026-10-02 exactly that happened: the cable was pulled mid-session,
+# this branch returned early, and the device then sat plugged in drawing
+# nothing while the battery drained 85% -> 74% over 73 minutes. The writes are
+# best-effort while the supply is offline; a refusal there is not a fault,
+# because there is nothing to charge at that moment either way.
+usb_online=$(cat "$USB/online" 2>/dev/null) || usb_online=unknown
+
 printf '9600000\n' > "$USB/voltage_now" 2>/dev/null || true
 pause 1
 if ! printf '3000000\n' > "$USB/input_current_limit"; then
+	if test "$usb_online" = 0; then
+		log 'both pumps verified off; USB offline (charger restore not accepted)'
+		exit 0
+	fi
 	fault 'both pumps are off, but Qualcomm charging could not be restored'
 	exit 1
+fi
+
+if test "$usb_online" = 0; then
+	log 'both pumps verified off; USB offline (charger restore written)'
+	exit 0
 fi
 
 log 'both pumps verified off; Qualcomm charger restored'

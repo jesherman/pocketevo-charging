@@ -184,17 +184,34 @@ direct_session()
 		classify_control_failure control
 		return 1
 	fi
-	# The adapter settles the new PPS operating point over ~2 s; verifying
-	# too early reads the tail of the previous contract.
-	pause 3
-	notify_watchdog
-
-	if ! usb_v=$(readv "$USB/voltage_now"); then
-		set_result i2c 'guard: failed to verify PPS voltage'
-		return 1
-	fi
-	if test "$usb_v" -lt $((target - 800000)) ||
-	   test "$usb_v" -gt $((target + 500000)); then
+	# The adapter settles the new PPS operating point in ~2 s, and a source
+	# parked at a higher contract still reports its *previous* operating point
+	# on the first sample. Poll and re-issue before declaring a fault: on
+	# 2026-10-02 this single check tripped twice at 9.595 V against an 8.8 V
+	# request, latched the session, and cost two manual cable cycles (~18 min)
+	# before the third attempt finally started charging. The tolerance above
+	# the request covers a source sitting at the 9.6 V park voltage the cleanup
+	# restores, while staying under the driver's 10.0 V pump enable ceiling.
+	rail_try=0
+	rail_ok=0
+	while test "$rail_try" -lt 4; do
+		rail_try=$((rail_try + 1))
+		pause 2
+		notify_watchdog
+		if ! usb_v=$(readv "$USB/voltage_now"); then
+			set_result i2c 'guard: failed to verify PPS voltage'
+			return 1
+		fi
+		if test "$usb_v" -ge $((target - 800000)) &&
+		   test "$usb_v" -le $((target + 800000)); then
+			rail_ok=1
+			break
+		fi
+		# Outside the window: re-issue. The first write can land before the
+		# source has left its previous operating point.
+		printf '%s\n' "$target" > "$USB/voltage_now" 2>/dev/null || true
+	done
+	if test "$rail_ok" != 1; then
 		set_result telemetry "guard: PPS request ${target}uV measured ${usb_v}uV"
 		return 1
 	fi
@@ -242,6 +259,7 @@ direct_session()
 	i=0
 	o_i=0
 	asym_i=0
+	z_i=0
 	while :; do
 		notify_watchdog
 		run_sample_hook || {
@@ -342,9 +360,46 @@ direct_session()
 		else
 			o_i=0
 		fi
+		# A session can look perfectly healthy while delivering nothing: both
+		# pumps report online and health=Good, the rail is in band and the
+		# request keeps being re-issued, yet no current moves at all. Every other
+		# guard here checks *state*; this is the only one that checks whether
+		# power is actually flowing. On 2026-10-02 the loop sat in exactly that
+		# state for 73 minutes while the device drained 85% -> 74% on the cable,
+		# and not one log line recorded it. 60 samples is 30 s of continuous zero
+		# delivery -- long enough to ignore a renegotiation dip, short enough to
+		# hand the charger back long before the battery notices.
+		if test "$total_i" -lt 200000; then
+			z_i=$((z_i + 1))
+			if test "$z_i" -ge 60; then
+				set_result no-delivery "guard: pumps enabled but delivering no current (${total_i}uA)"
+				return 1
+			fi
+		else
+			z_i=0
+		fi
 		if test "$master_t" -gt 650 || test "$slave_t" -gt 650; then set_result thermal "guard: pump temperature ${master_t}/${slave_t}dC exceeds 650dC"; return 1; fi
 
-		if test "$bat_v" -gt 4450000; then
+		# Regulate on the MEASURED rail, not only on the request. Nothing else
+		# here watches the rail itself, so the integrator below -- which raises
+		# the request whenever combined pump input is under 3.08 A, a figure the
+		# adapter in practice never quite reaches (~3.05 A) -- winds up to the
+		# 10.5 V request clamp and then sits there saturated. Under falling
+		# end-of-charge load the adapter holds its operating point a few hundred
+		# mV ABOVE the request, the rail crosses the 10.5 V pump ceiling, and the
+		# VIN guard ends the session with a latched "unplug the charger" fault on
+		# a perfectly healthy pack.
+		#
+		# That is exactly how the 2026-10-02 14:52 session died: 23 minutes of
+		# clean 32 W charging from 65% to 88%, then `guard: pump VIN out of range
+		# 10516000/10452000uV` and a latch -- the identical ending the 2026-09-29
+		# session had at 88%. Pull the request down while headroom remains so the
+		# VIN guard stays a backstop instead of a routine end-of-charge event.
+		if test "$master_v" -gt 10400000 || test "$slave_v" -gt 10400000; then
+			target=$((target - 200000))
+		elif test "$master_v" -gt 10300000 || test "$slave_v" -gt 10300000; then
+			target=$((target - 100000))
+		elif test "$bat_v" -gt 4450000; then
 			target=$((target - 80000))
 		elif test "$bat_v" -gt 4430000; then
 			:
@@ -404,6 +459,48 @@ latch_until_cable_cycle()
 	done
 }
 
+# Self-heal a Qualcomm charger that is online but moving no power.
+#
+# A mid-session cable pull can leave the charger firmware parked at a 5 V / 0 A
+# operating point: the cleanup used to skip its restore whenever it saw USB
+# already offline (fixed 2026-10-02, see armada-pocketevo-charge-cleanup). The
+# battery then discharges while the device reports itself plugged in, and
+# because eligible() requires battery/status=Charging the policy never starts a
+# session that could repair it -- the device sits dead on the cable until a
+# human notices. Re-assert the documented normal values when, and only when,
+# the stock path is demonstrably not charging; rate-limited so a genuinely dead
+# source is not hammered once a second.
+repair_stock_charger()
+{
+	usb_online=$(readv "$USB/online" 2>/dev/null) || return 0
+	test "$usb_online" = 1 || return 0
+	# Never touch the charger while either pump is enabled.
+	test "$(readv "$MASTER/online" 2>/dev/null)" = 0 || return 0
+	test "$(readv "$SLAVE/online" 2>/dev/null)" = 0 || return 0
+	# The battery must actually be losing charge, and the charger must be
+	# drawing nothing, before we touch anything at all.
+	repair_bat_i=$(readv "$BAT/current_now" 2>/dev/null) || return 0
+	test "$repair_bat_i" -lt 0 || return 0
+	repair_usb_i=$(readv "$USB/current_now" 2>/dev/null) || return 0
+	test "$repair_usb_i" -lt 100000 || return 0
+
+	now=$(cut -d' ' -f1 /proc/uptime)
+	now=${now%%.*}
+	if test -r "$STATE_DIR/last-repair"; then
+		last=$(cat "$STATE_DIR/last-repair" 2>/dev/null) || last=0
+		case $last in '' | *[!0-9]*) last=0 ;; esac
+		if test $((now - last)) -lt 60; then
+			return 0
+		fi
+	fi
+	printf '%s\n' "$now" > "$STATE_DIR/last-repair" 2>/dev/null || true
+
+	log "charger repair: input=${repair_usb_i}uA battery=${repair_bat_i}uA; re-asserting 9600000uV/3000000uA"
+	printf '9600000\n' > "$USB/voltage_now" 2>/dev/null || true
+	printf '3000000\n' > "$USB/input_current_limit" 2>/dev/null || true
+	return 0
+}
+
 on_exit()
 {
 	trap - EXIT
@@ -447,6 +544,24 @@ while :; do
 				exit 0
 			fi
 			;;
+		no-delivery)
+			# Not a fault, and it must not latch: the cleanup above just handed
+			# the charger back, so the right move is to stay out of the way long
+			# enough for the Qualcomm path to really take over -- re-entering
+			# direct charge immediately would only stall again. Feed the 15 s
+			# watchdog while waiting.
+			notify_status 'idle after no-delivery; Qualcomm charger has control'
+			log 'no-delivery: backing off 120s so the Qualcomm charger can take over'
+			if test "$MAX_EVENTS" -gt 0 && test "$events" -ge "$MAX_EVENTS"; then
+				exit 0
+			fi
+			backoff=0
+			while test "$backoff" -lt 24; do
+				notify_watchdog
+				pause 5
+				backoff=$((backoff + 1))
+			done
+			;;
 		*)
 			if ! latch_until_cable_cycle "$session_result"; then
 				exit 1
@@ -455,6 +570,8 @@ while :; do
 		esac
 	else
 		idle_loops=$((idle_loops + 1))
+		# Before the idle-loop exit, so a bounded run still gets to repair.
+		repair_stock_charger || true
 		if test "$MAX_IDLE_LOOPS" -gt 0 && test "$idle_loops" -ge "$MAX_IDLE_LOOPS"; then
 			exit 0
 		fi

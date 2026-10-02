@@ -30,6 +30,7 @@ ordinary image update needs no action at all. Nothing here writes to `/usr`,
 | Charge policy | `armada-pocketevo-charge-policy` | `/var/armada/charging/bin/` |
 | Re-apply at boot | `armada-charging-pack.service` | `/etc/systemd/system/` |
 | Re-apply on plug-in | `70-armada-charging-pack.rules` | `/etc/udev/rules.d/` |
+| Kernel identity gate | `charging-kernel-fingerprint.sh` | `/var/armada/charging/bin/` |
 | Opt-in flag | `pocketevo-direct-charge` | `/etc/armada/experimental/` |
 
 The EVO has **two** HL7139 charge pumps (i2c 0x5f master, 0x5e slave). The stock
@@ -82,18 +83,79 @@ sudo /var/armada/charging/bin/charging-control.sh enable    # or disable
 
 Or use the **28W Charging** icon in Desktop Mode, which opens the same menu.
 
-### Kernel versions
+### Kernel versions, and the identity gate
 
-The modules are keyed to the kernel release (`uname -r`). If an update bumps the
-kernel before a matching bundle exists, the boot unit records
+The modules are keyed to the kernel release (`uname -r`), but **the release does
+not identify the kernel**. armada has shipped at least two different 7.2.6 kernels
+built from different patch sets, and `uname -r` reports the same `7.2.6` for both.
+With `CONFIG_MODVERSIONS` off there is no symbol CRC for the kernel to check
+either, so a module built against the wrong build loads cleanly and the pack
+reports `ok` while running code that was never built for that kernel.
 
+That is not hypothetical. On 2026-10-01 the unit moved from image
+`20260928.311ed3b` to `20261001.72f2a63`, kept kernel release `7.2.6`, and the pack
+re-applied against a kernel it had never been built for — reporting success.
+Nothing had verified that; the pack simply never looked.
+
+So the pack fingerprints the **interface it actually compiles against** — every
+module armada ships for the power-supply subsystem — and refuses to load unless
+that set is what was present when the pack was validated on this device.
+
+#### Why not fingerprint the kernel itself
+
+Because it would be a false alarm every time. Measured 2026-10-02 across exactly
+that update, by building both trees with the same toolchain:
+
+| artifact | `311ed3b` build | `72f2a63` build |
+|---|---|---|
+| stock `qcom_battmgr.ko` | `e55f2670…` | `e55f2670…` identical |
+| this pack's patched `qcom_battmgr.ko` | `594c30ba…` | `594c30ba…` identical |
+| `vmlinuz` | `35aa183d…` | `5f109746…` **changed** |
+
+armada added three kernel patches in that window — an arm64 unaligned-atomics fix,
+a drm/msm submitqueue change and an input/rsinput calibration change — so `vmlinuz`
+changed, while the battery manager and its entire subsystem came out byte-identical.
+A gate keyed on `vmlinuz` would have refused a pack that was provably still correct,
+every few days, at the cost of a 40-minute kernel rebuild. Keying it on the subsystem
+refuses exactly when the interface really moves.
+
+That measurement is also the answer to the obvious question about the past mismatch:
+it was benign, and now it is *known* to have been benign rather than assumed — the
+pack's module was the same bytes in both builds.
+
+#### What it does
+
+- `install.sh` records the baseline, and refuses to install when the bundle was built
+  from a different armada commit than the image the device is running. Override with
+  `sudo ./install.sh --force` if you have a specific reason.
+- `charging-pack-apply.sh` only ever compares. It deliberately will **not** adopt a
+  new kernel on its own, because the first boot after an update would then silently
+  bless modules that were never built for that kernel — the exact failure above.
+- On a mismatch it writes
+
+  ```
+  degraded: image kernel changed since this pack was validated (<old> -> <new>);
+  refusing to load modules built for another kernel -- rebuild the pack for this
+  kernel and re-run install.sh
+  ```
+
+  to `/var/armada/charging/status`, dumps recorded-vs-running into
+  `/var/armada/charging/notes`, and falls back to the stock ~18 W buck charger. It
+  does not block the boot.
+
+Check the verdict without loading anything:
+
+```sh
+sudo /var/armada/charging/bin/charging-control.sh status    # "kernel identity:" line
+/var/armada/charging/bin/charging-kernel-fingerprint.sh check; echo $?  # 0 match, 1 changed, 2 no baseline, 3 cannot fingerprint
 ```
-degraded: no charging module pack for kernel <ver>
-```
 
-in `/var/armada/charging/status` and charging falls back to the stock ~18 W buck
-charger. It does **not** try to load a module built for another kernel, and it
-does not block the boot. Watch the Releases page for a rebuild.
+`ARMADA_CHARGING_SKIP_FINGERPRINT=1` bypasses the gate. That is a recovery hatch,
+not something to leave set.
+
+A release bump with no matching bundle still records
+`degraded: no charging module pack for kernel <ver>` and degrades identically.
+Watch the Releases page for a rebuild.
 
 ## Verifying
 
@@ -137,6 +199,17 @@ applies `patches/*.patch` after armada's own series, builds the kernel, builds
 `deploy.sh <bundle.tar.gz> <user@host>` copies a bundle to a device and runs the
 installer.
 
+Iterating on the payload — the installer, the units, the policy, the fingerprint
+helper — does **not** need a kernel rebuild, because the kernel build spends ~40
+minutes before it ever looks at `payload/`:
+
+```sh
+./build/make-bundle.sh    # re-stage and repack from the last build's modules
+```
+
+`build-pack.sh` calls that same script for its final phase, so there is exactly one
+implementation of what goes into the bundle.
+
 Builds are reproducible modulo one detail: three independent builds of the
 in-tree `qcom_battmgr.ko` produced a byte-identical sha256, while the
 out-of-tree `hl7139_evo.ko` embeds the absolute directory it was built in and so
@@ -164,6 +237,90 @@ match and SIGPIPEs `lsmod`, so the pipeline reports failure even though the
 module was found. The scripts use
 `grep -q "^$1 " /proc/modules` instead.
 
+## Tests
+
+```sh
+./tests/gate-test.sh
+```
+
+Drives `charging-pack-apply.sh --check` against a fake kernel tree and asserts the
+identity gate refuses when the kernel is rebuilt, when only the stock
+`qcom_battmgr.ko` changes, when only `.armada-source` changes, when a fingerprinted
+file disappears, and when no baseline exists at all — plus that it opens on a
+matching kernel and honours the bypass. No root, no device and no module loading:
+`--check` stops immediately after the gate.
+
+It earned its keep on the first run. The initial gate compared every non-comment
+line of the fingerprint file, including the `image=` and `armada_commit=`
+provenance lines, which the live fingerprint never emits — so it would have
+degraded unconditionally on the device, silently pinning the unit to 18 W.
+
+```sh
+./tests/charger-restore-test.sh
+```
+
+Drives the cleanup and the policy's idle path against a fake power-supply tree,
+so it needs no root, no device and no hardware. It covers the 2026-10-02
+regression end to end: the cleanup must restore the PPS request and release the
+13 mA handoff limit **even when VBUS is already absent**, the idle policy must
+re-assert sane charger values when — and only when — the Qualcomm path is online
+and drawing nothing, and neither may act while a pump is live, while the
+charger is healthy, or with no cable attached.
+
+```sh
+./tests/session-simulation-test.sh
+```
+
+Drives **whole sessions** through the policy's own sample hook against a fake
+power-supply tree — the only way to exercise the guards that end a session. It
+covers the `no-delivery` guard firing after 30 s of zero current, a 40-sample
+stall *not* firing it, the endpoint guard ending cleanly without latching, and
+the VIN-headroom regulator holding the request under 10.1 V against an adapter
+that runs 400 mV above it.
+
+## Charger handoff guards
+
+Three guards exist specifically because of the 2026-10-02 failure, where the
+device sat plugged in drawing nothing while the battery fell from 85% to 74%
+over 73 minutes.
+
+- **The cleanup always restores, cable or no cable.** The PPS request and the
+  13 mA handoff limit live in the charger firmware and outlive a cable pull, so
+  skipping the restore strands the *next* plug-in at a 5 V / 0 A operating
+  point. On the offline path the writes are best-effort and a refusal is not a
+  fault — there is nothing to charge at that moment either way.
+- **The watch loop ends a session that is not delivering power.** Every other
+  guard in `direct_session` checks *state* (pump flags, health, rail voltage);
+  `no-delivery` is the only one that checks whether current is actually moving.
+  60 consecutive samples — 30 s — below 200 mA ends the session, so the
+  Qualcomm path takes over instead of idling silently for hours.
+- **The idle policy repairs a dead charger.** When, and only when, the USB
+  supply is online, both pumps are off, the battery is discharging and the
+  charger is drawing under 100 mA, the policy re-asserts `9600000uV` /
+  `3000000uA`, rate-limited to once a minute. Without it a stuck charger stays
+  stuck until a human notices, because `eligible()` requires
+  `battery/status = Charging` and a dead charger never reports it.
+
+`no-delivery` deliberately does **not** latch a fault: the cleanup has already
+handed the charger back, so the session ends, the policy backs off for 120 s to
+let the stock path take over, and direct charge is free to start again. A latch
+here would turn a recoverable stall into a "unplug the charger" prompt.
+
+- **The request is regulated against the measured rail, not just the request.**
+  Nothing else watches the rail, so the integrator — which raises the request
+  whenever combined pump input is under 3.08 A, a figure this adapter never quite
+  reaches (~3.05 A) — winds up to the 10.5 V clamp and saturates there. Under
+  falling end-of-charge load the adapter holds its operating point a few hundred
+  mV *above* the request, the measured VIN crosses the 10.5 V pump ceiling, and
+  the VIN guard ends a perfectly healthy session with a latched "unplug the
+  charger" fault. On 2026-10-02 that killed a clean 32 W session at SOC 88% —
+  the same ending the 2026-09-29 session had. Above 10.4 V the request now drops
+  200 mV per sample, and 100 mV above 10.3 V, ahead of every other regulation
+  term. The VIN guard is a backstop again, not a routine end-of-charge event.
+
+The full failure analysis, including what could **not** be established, is in
+[`docs/incident-2026-10-02.md`](docs/incident-2026-10-02.md).
+
 ## Rolling back
 
 ```sh
@@ -181,19 +338,33 @@ sudo systemctl daemon-reload
 - **This replaces `qcom_battmgr` on a live system.** The swap happens at boot
   (and on plug-in), and if the patched module fails to load the installer
   restores the stock one.
+- **Kernel drift is gated; nothing else is.** The identity gate covers the
+  power-supply subsystem — see "Kernel versions, and the identity gate" above. If an
+  image update changes something *else* about charging (a unit, a firmware config,
+  the DTS, the in-tree pump driver) without touching that subsystem, the gate stays
+  quiet by design and this pack keeps loading.
 - **The fault IRQ is not wired.** The driver's fault handler (VIN/VBAT OVP, OCP,
   flying-cap short, thermal shutdown → disable charge) needs `intr-gpios`. The
   pump interrupt pins have no device-tree nodes, and their stock pin state is
   GPIO input with a pull-down while the driver requests a falling edge — so the
   handler could not fire reliably. Chip-level protection and the policy's
   independent guards (VIN range, VBUS coherence, current limits) still apply.
-  Closing this properly requires a DTB change.
+  The fix belongs upstream: armada carries the EVO device tree at
+  `packages/kernel/dts/qcs8550-ayaneo-pocketevo.dts` (with a `.patch` beside it),
+  so the pump nodes are a PR to armada rather than a local overlay — which also
+  cannot work here, since the shipped DTBs are built without `__symbols__` and
+  cannot be overlaid at runtime.
+- **Upstream collision risk — checked clear as of `72f2a63`.** A future image that
+  ships its own EVO pump driver, an `armada-pocketevo-charge-policy` unit, or a
+  `sm8550/ayaneo/pocketevo/battmgr.jsn` would fight this pack. As of 2026-10-02
+  none exist: no colliding unit or udev rule name, no userspace `hl7139`
+  reference, and no EVO `battmgr.jsn` — the EVO is the one SM8550 board without
+  one. The kernel gate will not catch this class of change, so re-check before
+  rebasing on a new image.
 - **Charger compatibility.** The policy ramps the PPS request to 10.5 V at up to
   ~3.06 A. Adapters that advertise PPS but misbehave at those points are the
   main risk. The policy verifies the measured rail against the request and tears
   the session down on mismatch.
-- **A future armada image that ships its own EVO pump driver or
-  `armada-pocketevo-charge-policy.service` will collide with this pack.**
 - Measured on one EVO: ~32 W drawn from the adapter, ~27 W into the device
   (stock path ~17.7 W).
 
